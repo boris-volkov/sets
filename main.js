@@ -351,6 +351,7 @@ function tokenize(input) {
   while (i < input.length) {
     const ch = input[i];
     if (/\s/.test(ch)) { i += 1; continue; }
+    if (input.slice(i, i + 3) === '...') { tokens.push('...'); i += 3; continue; }
     if (ch === '(' || ch === ')') { tokens.push(ch); i += 1; continue; }
     const match = input.slice(i).match(/^[a-zA-Z0-9]+/);
     if (match) {
@@ -375,6 +376,17 @@ function parseExpr(tokens) {
     const children = [];
     while (tokens[0] !== ')') {
       if (tokens.length === 0) throw new Error('Missing closing )');
+      // Range expansion: number ... number
+      if (tokens.length >= 3 && /^\d+$/.test(tokens[0]) && tokens[1] === '...' && /^\d+$/.test(tokens[2])) {
+        const start = Number(tokens.shift());
+        tokens.shift(); // '...'
+        const end = Number(tokens.shift());
+        const step = start <= end ? 1 : -1;
+        for (let n = start; step > 0 ? n <= end : n >= end; n += step) {
+          children.push({ type: 'label', name: String(n) });
+        }
+        continue;
+      }
       children.push(parseExpr(tokens));
     }
     tokens.shift(); // consume ')'
