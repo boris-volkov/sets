@@ -1,0 +1,512 @@
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const commandInput = document.getElementById('command');
+const logEl = document.getElementById('log');
+
+const circles = [];
+const cursor = { x: 0, y: 0, active: false };
+let radius = 80;
+let viewScale = 1;
+let dpr = window.devicePixelRatio || 1;
+const offset = { x: 0, y: 0 }; // device-pixel offset for panning implied by zoom-at-point
+let activeLabel = null;
+const highlight = { root: null, mask: null, params: null }; // root: AST
+const history = [];
+let historyIndex = 0;
+const snapshots = new Map();
+let spaceDown = false;
+let isPanning = false;
+const panStart = { x: 0, y: 0 };
+const offsetStart = { x: 0, y: 0 };
+const undoStack = [];
+let autoLabelCounter = 1;
+
+function pushUndo() {
+  const snapshot = JSON.parse(JSON.stringify({
+    circles,
+    viewScale,
+    offset,
+    radius,
+    autoLabelCounter
+  }));
+  undoStack.push(snapshot);
+  if (undoStack.length > 50) undoStack.shift(); // cap history
+}
+
+function resizeCanvas() {
+  dpr = window.devicePixelRatio || 1;
+  const { innerWidth: w, innerHeight: h } = window;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+}
+
+function clampRadius(value) {
+  const maxR = Math.max(canvas.width, canvas.height) / (dpr * viewScale) * 0.55; // enough to cover viewport
+  return Math.min(maxR, Math.max(10, value));
+}
+
+function clampScale(value) {
+  return Math.min(4, Math.max(0.3, value));
+}
+
+function makeMask() {
+  const c = document.createElement('canvas');
+  c.width = canvas.width;
+  c.height = canvas.height;
+  return { canvas: c, ctx: c.getContext('2d') };
+}
+
+function splitCircles() {
+  const labeled = new Map();
+  const unlabeled = [];
+  for (const c of circles) {
+    if (c.label) {
+      if (!labeled.has(c.label)) labeled.set(c.label, []);
+      labeled.get(c.label).push(c);
+    } else {
+      unlabeled.push(c);
+    }
+  }
+  return { labeled, unlabeled };
+}
+
+function drawLabelMask(label) {
+  const mask = makeMask();
+  mask.ctx.setTransform(dpr * viewScale, 0, 0, dpr * viewScale, offset.x, offset.y);
+  mask.ctx.fillStyle = '#00ff80'; // bright mask; opacity set at composite time
+  for (const c of circles) {
+    if (c.label !== label) continue;
+    mask.ctx.beginPath();
+    mask.ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+    mask.ctx.fill();
+  }
+  return mask;
+}
+
+function renderExpr(node) {
+  if (!node) return null;
+  if (node.type === 'label') return drawLabelMask(node.name);
+  const children = node.children.map(renderExpr).filter(Boolean);
+  if (children.length === 0) return null;
+  if (node.type === 'union') {
+    const out = makeMask();
+    for (const child of children) {
+      out.ctx.globalCompositeOperation = 'source-over';
+      out.ctx.drawImage(child.canvas, 0, 0);
+    }
+    out.ctx.globalCompositeOperation = 'source-over';
+    return out;
+  }
+  if (node.type === 'complement') {
+    const child = children[0];
+    const out = makeMask();
+    out.ctx.fillStyle = '#00ff00';
+    out.ctx.fillRect(0, 0, out.canvas.width, out.canvas.height);
+    out.ctx.globalCompositeOperation = 'destination-out';
+    out.ctx.drawImage(child.canvas, 0, 0);
+    out.ctx.globalCompositeOperation = 'source-over';
+    return out;
+  }
+  // intersection
+  const out = makeMask();
+  out.ctx.drawImage(children[0].canvas, 0, 0);
+  for (let i = 1; i < children.length; i += 1) {
+    out.ctx.globalCompositeOperation = 'source-in';
+    out.ctx.drawImage(children[i].canvas, 0, 0);
+  }
+  out.ctx.globalCompositeOperation = 'source-over';
+  return out;
+}
+
+function drawHighlightLayer() {
+  if (!highlight.root) return;
+  const signature = `${canvas.width}x${canvas.height}|${viewScale.toFixed(4)}|${offset.x.toFixed(2)},${offset.y.toFixed(2)}`;
+  if (!highlight.params || highlight.params !== signature) {
+    highlight.mask = renderExpr(highlight.root);
+    highlight.params = signature;
+  }
+  if (!highlight.mask) return;
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 0.25; // command highlights stay clear
+  ctx.drawImage(highlight.mask.canvas, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+function draw() {
+  const { width, height } = canvas;
+
+  // Reset to pixel space for clearing/background.
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  ctx.fillStyle = '#0b0f17';
+  ctx.fillRect(0, 0, width, height);
+
+  // Apply device pixel ratio and current view scale.
+  ctx.setTransform(dpr * viewScale, 0, 0, dpr * viewScale, offset.x, offset.y);
+
+  // Additive blend to light up sets; merge shapes by label into single masks.
+  const { labeled, unlabeled } = splitCircles();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.fillStyle = 'rgba(120, 180, 255, 0.08)'; // subtler base glow for unlabeled
+  for (const c of unlabeled) {
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  for (const [label, group] of labeled.entries()) {
+    const mask = makeMask();
+    mask.ctx.setTransform(dpr * viewScale, 0, 0, dpr * viewScale, offset.x, offset.y);
+    mask.ctx.fillStyle = '#22314a'; // slightly brighter lift above background
+    for (const c of group) {
+      mask.ctx.beginPath();
+      mask.ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+      mask.ctx.fill();
+    }
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0); // draw mask already in pixel space
+    ctx.globalAlpha = 0.26;
+    ctx.drawImage(mask.canvas, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  drawHighlightLayer();
+
+  ctx.globalCompositeOperation = 'source-over';
+
+  // Outline only unlabeled circles to avoid breaking merged shapes.
+  if (unlabeled.length) {
+    ctx.strokeStyle = 'rgba(139, 233, 253, 0.6)';
+    ctx.lineWidth = 2;
+    for (const c of unlabeled) {
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  // Labels: one per circle to avoid ambiguity on disjoint blobs.
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = '16px "IBM Plex Sans", "Segoe UI", system-ui, sans-serif';
+  for (const c of circles) {
+    if (!c.label) continue;
+    ctx.fillText(c.label, c.x, c.y);
+  }
+
+  // Preview of the next circle under the cursor.
+  if (cursor.active) {
+    const drawRadius = radius / viewScale;
+    ctx.setLineDash([6, 6]);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cursor.x, cursor.y, drawRadius, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  requestAnimationFrame(draw);
+}
+
+canvas.addEventListener('mousemove', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const sX = e.clientX - rect.left;
+  const sY = e.clientY - rect.top;
+  if (isPanning) {
+    const dx = (e.clientX - panStart.x) * dpr;
+    const dy = (e.clientY - panStart.y) * dpr;
+    offset.x = offsetStart.x + dx;
+    offset.y = offsetStart.y + dy;
+    highlight.params = null;
+  }
+  cursor.x = (sX - offset.x / dpr) / viewScale;
+  cursor.y = (sY - offset.y / dpr) / viewScale;
+  cursor.active = !isPanning;
+});
+
+canvas.addEventListener('mouseleave', () => {
+  cursor.active = false;
+  isPanning = false;
+});
+
+canvas.addEventListener('click', () => {
+  if (!cursor.active || isPanning) return;
+  pushUndo();
+  const drawRadius = radius / viewScale; // radius scales with zoom so zooming in yields finer sizes
+  const labelToUse = activeLabel || String(autoLabelCounter++); // auto-number unlabeled sets
+  circles.push({ x: cursor.x, y: cursor.y, r: drawRadius, label: labelToUse });
+  highlight.params = null; // new geometry; rerender highlight
+});
+
+canvas.addEventListener('wheel', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const sX = e.clientX - rect.left;
+  const sY = e.clientY - rect.top;
+  if (isPanning) return;
+  if (e.shiftKey) {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.08 : 0.92;
+    const newScale = clampScale(viewScale * factor);
+    const worldX = (sX - offset.x / dpr) / viewScale;
+    const worldY = (sY - offset.y / dpr) / viewScale;
+    viewScale = newScale;
+    // Recompute offset so the cursor point stays fixed on screen.
+    offset.x = dpr * (sX - viewScale * worldX);
+    offset.y = dpr * (sY - viewScale * worldY);
+    highlight.params = null;
+    return;
+  }
+  e.preventDefault();
+  const step = e.deltaY < 0 ? 6 : -6; // scroll up to grow
+  radius = clampRadius(radius + step);
+}, { passive: false });
+
+function clearCircles() {
+  if (circles.length) pushUndo();
+  circles.length = 0;
+  highlight.params = null;
+  autoLabelCounter = 1;
+}
+
+function saveSnapshot(name) {
+  const copy = JSON.parse(JSON.stringify({
+    circles,
+    viewScale,
+    offset,
+    radius,
+    autoLabelCounter
+  }));
+  snapshots.set(name, copy);
+  appendLog(`saved ${name}`, 'accent', `(load ${name})`);
+}
+
+function loadSnapshot(name) {
+  if (!snapshots.has(name)) {
+    appendLog(`no snapshot named ${name}`, 'error');
+    return;
+  }
+  pushUndo();
+  const snap = snapshots.get(name);
+  circles.length = 0;
+  circles.push(...snap.circles);
+  viewScale = snap.viewScale;
+  offset.x = snap.offset.x;
+  offset.y = snap.offset.y;
+  radius = snap.radius;
+  autoLabelCounter = snap.autoLabelCounter || 1;
+  highlight.params = null;
+  appendLog(`loaded ${name}`, 'accent');
+}
+
+function undo() {
+  if (!undoStack.length) {
+    appendLog('nothing to undo', 'error');
+    return;
+  }
+  const state = undoStack.pop();
+  circles.length = 0;
+  circles.push(...state.circles);
+  viewScale = state.viewScale;
+  offset.x = state.offset.x;
+  offset.y = state.offset.y;
+  radius = state.radius;
+  autoLabelCounter = state.autoLabelCounter || autoLabelCounter;
+  highlight.params = null;
+  appendLog('undo', 'accent');
+}
+
+function appendLog(text, tone = 'normal', cmd = null) {
+  const div = document.createElement('div');
+  div.className = `line ${tone === 'error' ? 'error' : tone === 'accent' ? 'accent' : ''}`.trim();
+  div.textContent = text;
+  if (cmd) {
+    div.classList.add('clickable');
+    div.dataset.cmd = cmd;
+    div.addEventListener('click', () => {
+      commandInput.value = cmd;
+      commandInput.focus();
+      parseCommand(cmd, true);
+    });
+  }
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(text, tone = 'accent') {
+  appendLog(text, tone);
+}
+
+function tokenize(input) {
+  const tokens = [];
+  let i = 0;
+  while (i < input.length) {
+    const ch = input[i];
+    if (/\s/.test(ch)) { i += 1; continue; }
+    if (ch === '(' || ch === ')') { tokens.push(ch); i += 1; continue; }
+    const match = input.slice(i).match(/^[a-zA-Z0-9]+/);
+    if (match) {
+      tokens.push(match[0]);
+      i += match[0].length;
+      continue;
+    }
+    // Unknown character
+    tokens.push(ch);
+    i += 1;
+  }
+  return tokens;
+}
+
+function parseExpr(tokens) {
+  if (tokens.length === 0) throw new Error('Unexpected end of input');
+  const token = tokens.shift();
+  if (token === '(') {
+    if (tokens.length === 0) throw new Error('Expected operator after "("');
+    const op = tokens.shift().toLowerCase();
+    if (op !== 'union' && op !== 'intersection' && op !== 'complement') throw new Error('Operator must be union, intersection, or complement');
+    const children = [];
+    while (tokens[0] !== ')') {
+      if (tokens.length === 0) throw new Error('Missing closing )');
+      children.push(parseExpr(tokens));
+    }
+    tokens.shift(); // consume ')'
+    if (op === 'complement' && children.length !== 1) throw new Error('complement needs exactly one argument');
+    if (op !== 'complement' && children.length === 0) throw new Error(`${op} needs at least one argument`);
+    return { type: op, children };
+  }
+  if (token === ')') throw new Error('Unexpected )');
+  return { type: 'label', name: token.toUpperCase() };
+}
+
+function parseCommand(cmd, echo = true) {
+  const raw = cmd.trim();
+  if (echo && raw) appendLog(`> ${raw}`, 'accent', raw);
+  if (!raw) {
+    highlight.root = null;
+    highlight.mask = null;
+    highlight.params = null;
+    setStatus('Highlight cleared');
+    return;
+  }
+  const saveMatch = raw.match(/^\(?\s*save\s+([A-Za-z0-9_-]+)\s*\)?$/i);
+  const loadMatch = raw.match(/^\(?\s*load\s+([A-Za-z0-9_-]+)\s*\)?$/i);
+  if (saveMatch) {
+    saveSnapshot(saveMatch[1]);
+    return;
+  }
+  if (loadMatch) {
+    loadSnapshot(loadMatch[1]);
+    return;
+  }
+  try {
+    const tokens = tokenize(raw);
+    const ast = parseExpr(tokens);
+    if (tokens.length) throw new Error('Extra tokens after expression');
+    highlight.root = ast;
+    highlight.mask = null;
+    highlight.params = null;
+    setStatus('OK');
+  } catch (err) {
+    setStatus(err.message, 'error');
+  }
+}
+
+commandInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const cmd = commandInput.value;
+    if (cmd.trim()) {
+      history.push(cmd);
+      historyIndex = history.length;
+    }
+    parseCommand(cmd);
+    commandInput.value = '';
+    return;
+  }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (history.length === 0) return;
+    if (historyIndex === history.length) historyIndex = Math.max(0, history.length - 1);
+    else historyIndex = Math.max(0, historyIndex - 1);
+    commandInput.value = history[historyIndex] || '';
+    commandInput.setSelectionRange(commandInput.value.length, commandInput.value.length);
+    return;
+  }
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (history.length === 0) return;
+    historyIndex = Math.min(history.length, historyIndex + 1);
+    commandInput.value = historyIndex === history.length ? '' : history[historyIndex];
+    commandInput.setSelectionRange(commandInput.value.length, commandInput.value.length);
+    return;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    commandInput.blur();
+    canvas.focus({ preventScroll: true });
+  }
+});
+
+window.addEventListener('keydown', (e) => {
+  if (document.activeElement === commandInput) return;
+  if (e.key === 'Backspace') {
+    e.preventDefault();
+    clearCircles();
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+    e.preventDefault();
+    undo();
+    return;
+  }
+  if (e.code === 'Space') {
+    e.preventDefault();
+    spaceDown = true;
+    return;
+  }
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key && e.key.length === 1 && /[a-zA-Z0-9]/.test(e.key)) {
+    activeLabel = e.key.toUpperCase();
+  }
+});
+
+window.addEventListener('keyup', (e) => {
+  if (activeLabel && e.key && e.key.length === 1 && e.key.toUpperCase() === activeLabel) {
+    activeLabel = null;
+  }
+  if (e.code === 'Space') {
+    spaceDown = false;
+    isPanning = false;
+  }
+});
+
+window.addEventListener('resize', resizeCanvas);
+window.addEventListener('resize', () => {
+  // Invalidate highlight mask so it re-renders with new dimensions.
+  highlight.params = null;
+});
+canvas.addEventListener('mousedown', (e) => {
+  if (!spaceDown) return;
+  e.preventDefault();
+  isPanning = true;
+  panStart.x = e.clientX;
+  panStart.y = e.clientY;
+  offsetStart.x = offset.x;
+  offsetStart.y = offset.y;
+});
+window.addEventListener('mouseup', () => {
+  isPanning = false;
+});
+resizeCanvas();
+appendLog('Type prefix commands: union / intersection / complement', 'accent');
+appendLog('Examples: (union A B), (intersection A (union B C)), (complement A)');
+appendLog('State: (save foo) then (load foo)', 'accent');
+requestAnimationFrame(draw);
