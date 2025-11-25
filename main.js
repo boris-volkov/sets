@@ -20,6 +20,7 @@ const panStart = { x: 0, y: 0 };
 const offsetStart = { x: 0, y: 0 };
 const undoStack = [];
 let autoLabelCounter = 1;
+let quizTarget = null;
 
 function pushUndo() {
   const snapshot = JSON.parse(JSON.stringify({
@@ -39,6 +40,60 @@ function numericLabels() {
     if (c.label && /^\d+$/.test(c.label)) set.add(c.label);
   }
   return Array.from(set).sort((a, b) => Number(a) - Number(b));
+}
+
+function randomLabels(pool, count) {
+  const copy = [...pool];
+  const chosen = [];
+  while (copy.length && chosen.length < count) {
+    const idx = Math.floor(Math.random() * copy.length);
+    chosen.push(copy[idx]);
+    copy.splice(idx, 1);
+  }
+  return chosen;
+}
+
+function randomExpr(labels, depth) {
+  if (depth <= 1 || labels.length === 1) {
+    const pick = labels[Math.floor(Math.random() * labels.length)];
+    return { type: 'label', name: pick };
+  }
+  const opChoices = ['union', 'intersection', 'complement'];
+  const op = opChoices[Math.floor(Math.random() * opChoices.length)];
+  if (op === 'complement') {
+    return { type: 'complement', children: [randomExpr(labels, depth - 1)] };
+  }
+  const childCount = Math.max(2, Math.min(3, labels.length));
+  const picked = randomLabels(labels, childCount);
+  const children = picked.map(() => randomExpr(labels, depth - 1));
+  return { type: op, children };
+}
+
+function masksSimilar(aMask, bMask, toleranceRatio = 0.01, threshold = 5) {
+  const a = aMask.canvas;
+  const b = bMask.canvas;
+  if (a.width !== b.width || a.height !== b.height) return false;
+  const ad = aMask.ctx.getImageData(0, 0, a.width, a.height).data;
+  const bd = bMask.ctx.getImageData(0, 0, b.width, b.height).data;
+  const len = ad.length;
+  let diff = 0;
+  let count = 0;
+  for (let i = 0; i < len; i += 4) {
+    const aOn = ad[i + 3] > threshold;
+    const bOn = bd[i + 3] > threshold;
+    if (aOn || bOn) count += 1;
+    if (aOn !== bOn) diff += 1;
+  }
+  if (count === 0) return diff === 0;
+  return diff / count <= toleranceRatio;
+}
+
+function maskHasPixels(mask, threshold = 5) {
+  const data = mask.ctx.getImageData(0, 0, mask.canvas.width, mask.canvas.height).data;
+  for (let i = 3; i < data.length; i += 4) {
+    if (data[i] > threshold) return true;
+  }
+  return false;
 }
 
 function resizeCanvas() {
@@ -156,7 +211,7 @@ function renderExpr(node) {
   if (node.type === 'complement') {
     const child = children[0];
     const out = makeMask();
-    out.ctx.fillStyle = '#00ff00';
+    out.ctx.fillStyle = '#00ff80';
     out.ctx.fillRect(0, 0, out.canvas.width, out.canvas.height);
     out.ctx.globalCompositeOperation = 'destination-out';
     out.ctx.drawImage(child.canvas, 0, 0);
@@ -176,7 +231,7 @@ function renderExpr(node) {
 
 function drawHighlightLayer() {
   if (!highlight.root) return;
-  const signature = `${canvas.width}x${canvas.height}|${viewScale.toFixed(4)}|${offset.x.toFixed(2)},${offset.y.toFixed(2)}`;
+  const signature = `${canvas.width}x${canvas.height}|${viewScale.toFixed(4)}|${offset.x.toFixed(2)},${offset.y.toFixed(2)}|${quizTarget ? 'quiz' : 'cmd'}`;
   if (!highlight.params || highlight.params !== signature) {
     highlight.mask = renderExpr(highlight.root);
     highlight.params = signature;
@@ -185,7 +240,7 @@ function drawHighlightLayer() {
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalCompositeOperation = 'lighter';
-  ctx.globalAlpha = 0.25; // command highlights stay clear
+  ctx.globalAlpha = 0.18; // uniform intensity across ops
   ctx.drawImage(highlight.mask.canvas, 0, 0);
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
@@ -467,6 +522,8 @@ function parseCommand(cmd, echo = true) {
   const loadMatch = raw.match(/^\(?\s*load\s+([A-Za-z0-9_-]+)\s*\)?$/i);
   const limsupOnly = /^\(\s*limit-superior\s*\)$/i.test(raw);
   const liminfOnly = /^\(\s*limit-inferior\s*\)$/i.test(raw);
+  const quizMatch = raw.match(/^\(\s*quiz(?:\s+(\d+))?\s*\)$/i);
+  const answerMatch = raw.match(/^\(\s*answer\s+(.+)\)$/i);
   if (saveMatch) {
     saveSnapshot(saveMatch[1]);
     return;
@@ -486,6 +543,54 @@ function parseCommand(cmd, echo = true) {
     highlight.mask = null;
     highlight.params = null;
     setStatus('OK');
+    return;
+  }
+  if (quizMatch) {
+    const depth = quizMatch[1] ? Math.max(1, Math.min(6, Number(quizMatch[1]))) : 2;
+    const labels = numericLabels();
+    if (labels.length < 2) {
+      setStatus('Need at least two numbered sets for quiz', 'error');
+      return;
+    }
+    let ast = null;
+    let mask = null;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      ast = randomExpr(labels, depth);
+      mask = renderExpr(ast);
+      if (mask && maskHasPixels(mask)) break;
+    }
+    if (!mask || !maskHasPixels(mask)) {
+      setStatus('Could not generate non-empty quiz target', 'error');
+      return;
+    }
+    quizTarget = { ast, mask };
+    highlight.root = ast;
+    highlight.mask = mask;
+    highlight.params = null;
+    setStatus(`Quiz: depth ${depth} — enter an equivalent expression`);
+    return;
+  }
+  if (answerMatch) {
+    if (!quizTarget) {
+      setStatus('No active quiz', 'error');
+      return;
+    }
+    const guessRaw = answerMatch[1];
+    try {
+      const tokens = tokenize(guessRaw);
+      const ast = parseExpr(tokens);
+      if (tokens.length) throw new Error('Extra tokens after expression');
+      const mask = renderExpr(ast);
+      const equal = masksSimilar(quizTarget.mask, mask, 0.02, 5); // allow small edge differences
+      if (equal) {
+        setStatus('Correct!');
+        quizTarget = null;
+      } else {
+        setStatus('Incorrect', 'error');
+      }
+    } catch (err) {
+      setStatus(err.message, 'error');
+    }
     return;
   }
   try {
@@ -590,5 +695,5 @@ window.addEventListener('mouseup', () => {
 resizeCanvas();
 appendLog('Type prefix commands: union / intersection / complement', 'accent');
 appendLog('Examples: (union A B), (intersection A (union B C)), (complement A)');
-appendLog('State: (save foo) then (load foo)', 'accent');
+appendLog('State: (save scene1) then (load scene1)', 'accent');
 requestAnimationFrame(draw);
