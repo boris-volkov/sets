@@ -73,7 +73,7 @@ canvas:focus { outline: none; }
   border-radius: 6px;
   border: 1px solid rgba(139, 233, 253, 0.5);
   background: rgba(12, 17, 28, 0.95);
-  color: var(--ink);
+  color: var(--accent);
   font-size: 14px;
   font-family: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
   outline: none;

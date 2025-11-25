@@ -218,6 +218,16 @@ function renderExpr(node) {
     out.ctx.globalCompositeOperation = 'source-over';
     return out;
   }
+  if (node.type === '\\') {
+    const out = makeMask();
+    out.ctx.drawImage(children[0].canvas, 0, 0);
+    for (let i = 1; i < children.length; i += 1) {
+      out.ctx.globalCompositeOperation = 'destination-out';
+      out.ctx.drawImage(children[i].canvas, 0, 0);
+    }
+    out.ctx.globalCompositeOperation = 'source-over';
+    return out;
+  }
   // intersection
   const out = makeMask();
   out.ctx.drawImage(children[0].canvas, 0, 0);
@@ -485,8 +495,8 @@ function parseExpr(tokens) {
   if (token === '(') {
     if (tokens.length === 0) throw new Error('Expected operator after "("');
     const op = tokens.shift().toLowerCase();
-    const allowed = ['union', 'intersection', 'complement', 'limit-superior', 'limit-inferior'];
-    if (!allowed.includes(op)) throw new Error('Operator must be union, intersection, complement, limit-superior, or limit-inferior');
+    const allowed = ['union', 'intersection', 'complement', 'limit-superior', 'limit-inferior', '\\'];
+    if (!allowed.includes(op)) throw new Error('Operator must be union, intersection, complement, limit-superior, limit-inferior, or \\');
     const children = [];
     while (tokens[0] !== ')') {
       if (tokens.length === 0) throw new Error('Missing closing )');
@@ -505,7 +515,8 @@ function parseExpr(tokens) {
     }
     tokens.shift(); // consume ')'
     if (op === 'complement' && children.length !== 1) throw new Error('complement needs exactly one argument');
-    if (op !== 'complement' && children.length === 0) throw new Error(`${op} needs at least one argument`);
+    if (op === '\\' && children.length < 2) throw new Error('\\ needs at least two arguments');
+    if (op !== 'complement' && op !== '\\' && children.length === 0) throw new Error(`${op} needs at least one argument`);
     return { type: op, children };
   }
   if (token === ')') throw new Error('Unexpected )');
@@ -528,6 +539,7 @@ function parseCommand(cmd, echo = true) {
   const liminfOnly = /^\(\s*limit-inferior\s*\)$/i.test(raw);
   const quizMatch = raw.match(/^\(\s*quiz(?:\s+(\d+))?\s*\)$/i);
   const answerMatch = raw.match(/^\(\s*answer\s+(.+)\)$/i);
+  const clearMatch = /^\(\s*clear\s*\)$/i.test(raw);
   if (saveMatch) {
     saveSnapshot(saveMatch[1]);
     return;
@@ -547,6 +559,14 @@ function parseCommand(cmd, echo = true) {
     highlight.mask = null;
     highlight.params = null;
     setStatus('OK');
+    return;
+  }
+  if (clearMatch) {
+    clearCircles();
+    highlight.root = null;
+    highlight.mask = null;
+    highlight.params = null;
+    setStatus('Cleared');
     return;
   }
   if (quizMatch) {
