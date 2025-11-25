@@ -436,7 +436,11 @@ function undo() {
 function appendLog(text, tone = 'normal', cmd = null) {
   const div = document.createElement('div');
   div.className = `line ${tone === 'error' ? 'error' : tone === 'accent' ? 'accent' : ''}`.trim();
-  div.textContent = text;
+  const escaped = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  div.innerHTML = escaped.replace(/[\(\)]/g, (m) => `<span class="paren">${m}</span>`);
   if (cmd) {
     div.classList.add('clickable');
     div.dataset.cmd = cmd;
@@ -694,6 +698,6 @@ window.addEventListener('mouseup', () => {
 });
 resizeCanvas();
 appendLog('Type prefix commands: union / intersection / complement', 'accent');
-appendLog('Examples: (union A B), (intersection A (union B C)), (complement A)');
+appendLog('Examples: (union A B), (intersection A (union B C)), (complement A)', 'accent');
 appendLog('State: (save scene1) then (load scene1)', 'accent');
 requestAnimationFrame(draw);

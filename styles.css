@@ -43,6 +43,21 @@ canvas:focus { outline: none; }
   font-size: 13px;
   color: #d8e4ff;
 }
+#log::-webkit-scrollbar {
+  width: 10px;
+}
+#log::-webkit-scrollbar-track {
+  background: rgba(255, 145, 0, 0.08);
+}
+#log::-webkit-scrollbar-thumb {
+  background: #ff9900;
+  border-radius: 8px;
+  border: 2px solid rgba(12, 17, 28, 0.95);
+}
+#log {
+  scrollbar-color: #ff9900 rgba(255, 145, 0, 0.1);
+  scrollbar-width: thin;
+}
 #prompt-line {
   display: flex;
   align-items: center;
@@ -50,7 +65,7 @@ canvas:focus { outline: none; }
   font-family: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
 }
 .prompt {
-  color: var(--accent);
+  color: #ff9900;
 }
 #command {
   flex: 1 1 auto;
@@ -72,3 +87,4 @@ canvas:focus { outline: none; }
 .line.accent { color: var(--accent); }
 .line.error { color: #ff9aa2; }
 .line.clickable { cursor: pointer; text-decoration: underline; text-decoration-style: dotted; }
+.line .paren { color: #ff9900; }
