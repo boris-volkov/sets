@@ -33,6 +33,14 @@ function pushUndo() {
   if (undoStack.length > 50) undoStack.shift(); // cap history
 }
 
+function numericLabels() {
+  const set = new Set();
+  for (const c of circles) {
+    if (c.label && /^\d+$/.test(c.label)) set.add(c.label);
+  }
+  return Array.from(set).sort((a, b) => Number(a) - Number(b));
+}
+
 function resizeCanvas() {
   dpr = window.devicePixelRatio || 1;
   const { innerWidth: w, innerHeight: h } = window;
@@ -95,6 +103,52 @@ function renderExpr(node) {
     for (const child of children) {
       out.ctx.globalCompositeOperation = 'source-over';
       out.ctx.drawImage(child.canvas, 0, 0);
+    }
+    out.ctx.globalCompositeOperation = 'source-over';
+    return out;
+  }
+  if (node.type === 'limit-superior') {
+    // Finite analogue: intersection of tail unions.
+    const tailUnions = new Array(children.length);
+    let currentUnion = makeMask();
+    for (let i = children.length - 1; i >= 0; i -= 1) {
+      const nextUnion = makeMask();
+      nextUnion.ctx.drawImage(currentUnion.canvas, 0, 0);
+      nextUnion.ctx.globalCompositeOperation = 'source-over';
+      nextUnion.ctx.drawImage(children[i].canvas, 0, 0);
+      nextUnion.ctx.globalCompositeOperation = 'source-over';
+      tailUnions[i] = nextUnion;
+      currentUnion = nextUnion;
+    }
+    const out = makeMask();
+    out.ctx.drawImage(tailUnions[0].canvas, 0, 0);
+    for (let i = 1; i < tailUnions.length; i += 1) {
+      out.ctx.globalCompositeOperation = 'source-in';
+      out.ctx.drawImage(tailUnions[i].canvas, 0, 0);
+    }
+    out.ctx.globalCompositeOperation = 'source-over';
+    return out;
+  }
+  if (node.type === 'limit-inferior') {
+    // Finite analogue: union of tail intersections.
+    const tailIntersections = new Array(children.length);
+    let current = makeMask();
+    current.ctx.drawImage(children[children.length - 1].canvas, 0, 0);
+    current.ctx.globalCompositeOperation = 'source-over';
+    tailIntersections[children.length - 1] = current;
+    for (let i = children.length - 2; i >= 0; i -= 1) {
+      const next = makeMask();
+      next.ctx.drawImage(children[i].canvas, 0, 0);
+      next.ctx.globalCompositeOperation = 'source-in';
+      next.ctx.drawImage(current.canvas, 0, 0);
+      next.ctx.globalCompositeOperation = 'source-over';
+      tailIntersections[i] = next;
+      current = next;
+    }
+    const out = makeMask();
+    for (const m of tailIntersections) {
+      out.ctx.globalCompositeOperation = 'source-over';
+      out.ctx.drawImage(m.canvas, 0, 0);
     }
     out.ctx.globalCompositeOperation = 'source-over';
     return out;
@@ -353,7 +407,7 @@ function tokenize(input) {
     if (/\s/.test(ch)) { i += 1; continue; }
     if (input.slice(i, i + 3) === '...') { tokens.push('...'); i += 3; continue; }
     if (ch === '(' || ch === ')') { tokens.push(ch); i += 1; continue; }
-    const match = input.slice(i).match(/^[a-zA-Z0-9]+/);
+    const match = input.slice(i).match(/^[a-zA-Z0-9-]+/);
     if (match) {
       tokens.push(match[0]);
       i += match[0].length;
@@ -372,7 +426,8 @@ function parseExpr(tokens) {
   if (token === '(') {
     if (tokens.length === 0) throw new Error('Expected operator after "("');
     const op = tokens.shift().toLowerCase();
-    if (op !== 'union' && op !== 'intersection' && op !== 'complement') throw new Error('Operator must be union, intersection, or complement');
+    const allowed = ['union', 'intersection', 'complement', 'limit-superior', 'limit-inferior'];
+    if (!allowed.includes(op)) throw new Error('Operator must be union, intersection, complement, limit-superior, or limit-inferior');
     const children = [];
     while (tokens[0] !== ')') {
       if (tokens.length === 0) throw new Error('Missing closing )');
@@ -410,12 +465,27 @@ function parseCommand(cmd, echo = true) {
   }
   const saveMatch = raw.match(/^\(?\s*save\s+([A-Za-z0-9_-]+)\s*\)?$/i);
   const loadMatch = raw.match(/^\(?\s*load\s+([A-Za-z0-9_-]+)\s*\)?$/i);
+  const limsupOnly = /^\(\s*limit-superior\s*\)$/i.test(raw);
+  const liminfOnly = /^\(\s*limit-inferior\s*\)$/i.test(raw);
   if (saveMatch) {
     saveSnapshot(saveMatch[1]);
     return;
   }
   if (loadMatch) {
     loadSnapshot(loadMatch[1]);
+    return;
+  }
+  if (limsupOnly || liminfOnly) {
+    const labels = numericLabels();
+    if (!labels.length) {
+      setStatus('No numbered sets available', 'error');
+      return;
+    }
+    const children = labels.map((n) => ({ type: 'label', name: n }));
+    highlight.root = { type: limsupOnly ? 'limit-superior' : 'limit-inferior', children };
+    highlight.mask = null;
+    highlight.params = null;
+    setStatus('OK');
     return;
   }
   try {
